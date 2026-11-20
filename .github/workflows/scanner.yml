@@ -15,6 +15,14 @@ jobs:
       - name: Get repository files
         uses: actions/checkout@v4
 
+      - name: Restore and save scanner history
+        uses: actions/cache@v4
+        with:
+          path: .scanner_state.json
+          key: crypto-scanner-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            crypto-scanner-state-
+
       - name: Run opportunity scanner
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
