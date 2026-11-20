@@ -3,6 +3,7 @@ import os
 import json
 import re
 import html
+import hashlib
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -12,48 +13,72 @@ from urllib.parse import urlparse
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
-# Trusted editorial discovery feeds.
-# These discover leads; they do NOT certify individual promotions.
-SOURCES = {
-    "CoinDesk": "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "Cointelegraph": "https://cointelegraph.com/rss",
-}
+STATE_FILE = ".scanner_state.json"
+MAX_ALERTS = 8
+MAX_HISTORY = 1000
+
+# Free public RSS discovery. These are discovery sources,
+# NOT proof that an individual offer is genuine.
+QUERIES = [
+    "crypto airdrop OR token giveaway",
+    "crypto contest OR crypto prize giveaway",
+    "crypto learn and earn rewards",
+    "crypto testnet rewards OR web3 quests",
+    "web3 bug bounty OR crypto security bounty",
+    "web3 paid contributor jobs",
+    "Stake casino giveaway OR Stake social competition",
+    "Solcasino giveaway OR Solcasino competition",
+    "online casino crypto giveaway no deposit",
+]
+
+NEWS_FEEDS = [
+    "https://cointelegraph.com/rss",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+]
+
+def google_news_feed(query):
+    params = urllib.parse.urlencode({
+        "q": query,
+        "hl": "en-US",
+        "gl": "US",
+        "ceid": "US:en",
+    })
+    return "https://news.google.com/rss/search?" + params
+
+FEEDS = NEWS_FEEDS + [google_news_feed(q) for q in QUERIES]
 
 CATEGORIES = {
     "Airdrops & token rewards": [
-        "airdrop", "token distribution", "token rewards",
+        "airdrop", "token giveaway", "token distribution",
         "claim rewards"
     ],
     "Giveaways & contests": [
-        "giveaway", "prize pool", "crypto contest",
-        "competition", "win crypto"
+        "crypto giveaway", "crypto contest", "prize pool",
+        "win crypto", "giveaway"
     ],
     "Learn & Earn": [
-        "learn and earn", "learning rewards",
-        "educational rewards"
+        "learn and earn", "learning rewards"
     ],
     "Testnets & quests": [
         "testnet rewards", "testnet incentive",
-        "ecosystem quest", "community quest"
+        "ecosystem quest", "web3 quest"
     ],
     "Bug bounties": [
         "bug bounty", "security bounty",
         "vulnerability reward"
     ],
-    "Freelancing & paid tasks": [
-        "crypto freelance", "web3 jobs",
-        "paid contributor", "developer bounty",
-        "community contributor"
+    "Paid Web3 tasks": [
+        "web3 jobs", "paid contributor",
+        "developer bounty", "crypto freelance"
     ],
-    "Exchange promotions": [
-        "exchange rewards", "trading competition",
-        "exchange campaign", "welcome reward"
+    "Casino social giveaways": [
+        "stake giveaway", "stake social competition",
+        "solcasino giveaway", "solcasino competition",
+        "casino crypto giveaway"
     ],
 }
 
 BLOCKED_PHRASES = [
-    "guaranteed profit",
-    "double your crypto",
     "send crypto to receive",
     "send us your bitcoin",
     "seed phrase required",
@@ -61,25 +86,33 @@ BLOCKED_PHRASES = [
     "wallet verification fee",
     "claim fee",
     "activation fee",
+    "pay to withdraw",
     "withdrawal fee to claim",
-    "100% guaranteed",
-    "risk free profit",
-    "recover lost crypto",
+    "double your crypto",
+    "guaranteed profit",
 ]
 
-MAX_ITEMS_PER_SOURCE = 35
-MAX_ALERTS = 8
+RISK_PHRASES = [
+    "deposit required", "first deposit",
+    "wagering requirement", "wager requirement",
+    "playthrough requirement", "turnover requirement",
+    "bet to qualify", "purchase required",
+]
 
-
-def fetch_feed(source, feed_url):
+def fetch(url):
     request = urllib.request.Request(
-        feed_url,
+        url,
         headers={"User-Agent": "CryptoOpportunityHunter/1.0"}
     )
-
     with urllib.request.urlopen(request, timeout=25) as response:
-        root = ET.fromstring(response.read())
+        return response.read()
 
+def clean(value):
+    value = re.sub(r"<[^>]+>", " ", value or "")
+    return re.sub(r"\s+", " ", html.unescape(value)).strip()
+
+def read_feed(url):
+    root = ET.fromstring(fetch(url))
     entries = root.findall(".//item")
 
     if not entries:
@@ -89,8 +122,8 @@ def fetch_feed(source, feed_url):
 
     results = []
 
-    for entry in entries[:MAX_ITEMS_PER_SOURCE]:
-        title = entry.findtext("title") or ""
+    for entry in entries[:40]:
+        title = clean(entry.findtext("title"))
         link = entry.findtext("link") or ""
 
         if not link:
@@ -100,33 +133,25 @@ def fetch_feed(source, feed_url):
             if element is not None:
                 link = element.get("href", "")
 
-        description = (
+        description = clean(
             entry.findtext("description")
             or entry.findtext(
                 "{http://www.w3.org/2005/Atom}summary"
             )
-            or ""
         )
 
         if title and link:
             results.append({
-                "source": source,
-                "title": html.unescape(
-                    re.sub("<[^>]+>", " ", title)
-                ).strip(),
-                "description": html.unescape(
-                    re.sub("<[^>]+>", " ", description)
-                ).strip(),
-                "link": link.strip()
+                "title": title,
+                "description": description,
+                "link": link.strip(),
             })
 
     return results
 
-
-def safe_link(url):
+def valid_link(url):
     try:
         parsed = urlparse(url)
-
         return (
             parsed.scheme == "https"
             and bool(parsed.hostname)
@@ -136,55 +161,39 @@ def safe_link(url):
     except Exception:
         return False
 
-
 def classify(item):
-    text = (
-        item["title"] + " " + item["description"]
-    ).lower()
+    text = (item["title"] + " " + item["description"]).lower()
 
-    if any(word in text for word in BLOCKED_PHRASES):
-        return None
+    if any(term in text for term in BLOCKED_PHRASES):
+        return None, "REJECTED"
 
     for category, keywords in CATEGORIES.items():
         if any(keyword in text for keyword in keywords):
-            return category
+            if any(term in text for term in RISK_PHRASES):
+                return category, "HIGH RISK - CONDITIONS MENTIONED"
 
-    return None
+            return category, "NEEDS MANUAL REVIEW"
 
+    return None, None
 
-def discover():
-    opportunities = []
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"reported": []}
 
-    for source, url in SOURCES.items():
-        try:
-            items = fetch_feed(source, url)
-
-            for item in items:
-                if not safe_link(item["link"]):
-                    continue
-
-                category = classify(item)
-
-                if category:
-                    item["category"] = category
-                    opportunities.append(item)
-
-        except Exception as error:
-            print(f"Feed error ({source}): {error}")
-
-    return opportunities
-
+def save_state(state):
+    state["reported"] = state["reported"][-MAX_HISTORY:]
+    with open(STATE_FILE, "w", encoding="utf-8") as file:
+        json.dump(state, file, indent=2)
 
 def send_telegram(message):
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{BOT_TOKEN}/sendMessage"
-    )
-
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
         "text": message,
-        "disable_web_page_preview": "true"
+        "disable_web_page_preview": "true",
     }).encode()
 
     request = urllib.request.Request(url, data=payload)
@@ -195,47 +204,100 @@ def send_telegram(message):
     if not result.get("ok"):
         raise RuntimeError("Telegram delivery failed")
 
-
 def main():
-    print("Starting Crypto Opportunity Hunter...")
+    print("Starting Crypto Opportunity Hunter")
 
-    opportunities = discover()
+    state = load_state()
+    reported = set(state.get("reported", []))
+    discovered = []
+    successful_feeds = 0
+    failed_feeds = 0
 
-    print(f"Discovered {len(opportunities)} matching leads.")
+    for feed_url in FEEDS:
+        try:
+            entries = read_feed(feed_url)
+            successful_feeds += 1
 
-    if not opportunities:
-        print("No matching opportunities found.")
-        return
+            for item in entries:
+                if not valid_link(item["link"]):
+                    continue
 
-    opportunities = opportunities[:MAX_ALERTS]
+                host = (urlparse(item["link"]).hostname or "").lower()
 
-    message = (
-        "🚀 CRYPTO OPPORTUNITY HUNTER\n"
-        "New opportunity leads discovered\n\n"
-        "⚠️ DISCOVERY IS NOT VERIFICATION.\n"
-        "Check the official project website and "
-        "full reward conditions before participating.\n\n"
+                # X is deliberately excluded until a dependable
+                # free discovery source is available.
+                if host in ("x.com", "www.x.com",
+                            "twitter.com", "www.twitter.com"):
+                    continue
+
+                category, status = classify(item)
+
+                if not category:
+                    continue
+
+                fingerprint = hashlib.sha256(
+                    item["link"].encode()
+                ).hexdigest()
+
+                if fingerprint in reported:
+                    continue
+
+                item["category"] = category
+                item["status"] = status
+                item["fingerprint"] = fingerprint
+                discovered.append(item)
+
+        except Exception as error:
+            failed_feeds += 1
+            print(f"Feed error: {error}")
+
+    if successful_feeds == 0:
+        raise RuntimeError("All discovery feeds failed")
+
+    discovered = discovered[:MAX_ALERTS]
+
+    now = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
     )
 
-    for number, item in enumerate(opportunities, 1):
-        message += (
-            f"{number}. {item['category']}\n"
-            f"📌 {item['title'][:180]}\n"
-            f"📰 Discovery source: {item['source']}\n"
-            f"🔗 {item['link']}\n\n"
+    if discovered:
+        message = (
+            "🚀 CRYPTO OPPORTUNITY HUNTER\n"
+            "New discovery leads\n\n"
+            "⚠️ NONE OF THESE OFFERS ARE AUTOMATICALLY VERIFIED.\n"
+            "Review the official source and full conditions.\n\n"
+        )
+
+        for number, item in enumerate(discovered, 1):
+            message += (
+                f"{number}. {item['category']}\n"
+                f"Status: {item['status']}\n"
+                f"Title: {item['title'][:180]}\n"
+                f"Link: {item['link']}\n\n"
+            )
+            reported.add(item["fingerprint"])
+
+        save_state({"reported": list(reported)})
+
+    else:
+        message = (
+            "🟢 CRYPTO OPPORTUNITY HUNTER HEARTBEAT\n\n"
+            "Scanner ran successfully.\n"
+            "No new matching leads were found.\n\n"
         )
 
     message += (
-        "🔐 Never share seed phrases or private keys.\n"
-        "Never pay to unlock a supposedly free reward.\n"
-        "No opportunity is approved automatically.\n\n"
-        f"🕒 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+        f"Feeds successful: {successful_feeds}\n"
+        f"Feeds failed: {failed_feeds}\n"
+        f"New leads: {len(discovered)}\n"
+        f"Time: {now}\n\n"
+        "🔐 Never share wallet seed phrases or private keys.\n"
+        "Never pay to unlock a free reward.\n"
+        "Manual approval only."
     )
 
     send_telegram(message)
-
-    print("Telegram alerts sent successfully.")
-
+    print("Telegram message delivered.")
 
 if __name__ == "__main__":
     main()
