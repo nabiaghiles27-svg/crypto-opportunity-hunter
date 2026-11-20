@@ -18,7 +18,18 @@ MAX_ALERTS = 5
 MAX_HISTORY = 1500
 MAX_ITEMS_PER_FEED = 40
 
-# Search for campaign-style announcements, not general crypto news.
+# Only these known platform domains can pass the source check.
+# This is a source filter, NOT a guarantee that a campaign is genuine.
+OFFICIAL_DOMAINS = {
+    "binance.com",
+    "coinbase.com",
+    "galxe.com",
+    "layer3.xyz",
+    "zealy.io",
+    "gitcoin.co",
+    "stake.com",
+}
+
 QUERIES = [
     '"airdrop is live" crypto',
     '"claim your airdrop" crypto',
@@ -44,7 +55,6 @@ FEEDS = [
     for query in QUERIES
 ]
 
-# These phrases strongly suggest editorial/news content, not a live campaign.
 EDITORIAL_PHRASES = [
     "best crypto",
     "best learn",
@@ -81,6 +91,22 @@ EDITORIAL_PHRASES = [
     "in 2025",
 ]
 
+EDITORIAL_PATHS = {
+    "news",
+    "blog",
+    "academy",
+    "research",
+    "article",
+    "articles",
+    "press",
+    "press-release",
+    "press-releases",
+    "learn",
+    "square",
+    "media",
+    "insights",
+}
+
 BLOCKED_PHRASES = [
     "seed phrase required",
     "share your private key",
@@ -109,7 +135,6 @@ RISK_PHRASES = [
     "stake tokens to qualify",
 ]
 
-# A result must have a concrete campaign action in its TITLE.
 CAMPAIGN_TITLE_PATTERNS = [
     r"\bairdrop is live\b",
     r"\bclaim your\b.*\bairdrop\b",
@@ -125,67 +150,35 @@ CAMPAIGN_TITLE_PATTERNS = [
     r"\bpaid contributor\b",
 ]
 
-CASINO_TERMS = [
-    "stake",
-    "solcasino",
-    "casino",
-]
-
 CATEGORY_RULES = [
-    (
-        "Casino social giveaways",
-        ["stake", "solcasino", "casino"],
-    ),
-    (
-        "Airdrops & token rewards",
-        ["airdrop", "claim your", "claim tokens"],
-    ),
-    (
-        "Giveaways & contests",
-        ["giveaway", "contest", "competition", "prize"],
-    ),
-    (
-        "Learn & Earn",
-        ["learn and earn", "learning rewards"],
-    ),
-    (
-        "Testnets & quests",
-        ["testnet", "quest", "incentive program"],
-    ),
-    (
-        "Bug bounties",
-        ["bug bounty", "security bounty"],
-    ),
-    (
-        "Paid Web3 tasks",
-        ["paid contributor"],
-    ),
+    ("Casino social giveaways", ["stake", "solcasino", "casino"]),
+    ("Airdrops & token rewards", ["airdrop", "claim your", "claim tokens"]),
+    ("Giveaways & contests", ["giveaway", "contest", "competition", "prize"]),
+    ("Learn & Earn", ["learn and earn", "learning rewards"]),
+    ("Testnets & quests", ["testnet", "quest", "incentive program"]),
+    ("Bug bounties", ["bug bounty", "security bounty"]),
+    ("Paid Web3 tasks", ["paid contributor"]),
 ]
 
 
-def fetch(url):
+def fetch_response(url, timeout=25):
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 CryptoOpportunityHunter/2.0"
+            "User-Agent": "Mozilla/5.0 CryptoOpportunityHunter/3.0",
         },
     )
-
-    with urllib.request.urlopen(request, timeout=25) as response:
-        return response.read()
+    return urllib.request.urlopen(request, timeout=timeout)
 
 
 def clean(value):
     value = re.sub(r"<[^>]+>", " ", value or "")
-    return re.sub(
-        r"\s+",
-        " ",
-        html.unescape(value),
-    ).strip()
+    return re.sub(r"\s+", " ", html.unescape(value)).strip()
 
 
 def read_feed(url):
-    root = ET.fromstring(fetch(url))
+    with fetch_response(url) as response:
+        root = ET.fromstring(response.read())
 
     entries = root.findall(".//item")
 
@@ -198,7 +191,6 @@ def read_feed(url):
 
     for entry in entries[:MAX_ITEMS_PER_FEED]:
         title = clean(entry.findtext("title"))
-
         link = entry.findtext("link") or ""
 
         if not link:
@@ -225,18 +217,49 @@ def read_feed(url):
     return results
 
 
-def valid_link(url):
-    try:
-        parsed = urlparse(url)
+def domain_allowed(host):
+    host = (host or "").lower().split(":")[0]
 
-        return (
-            parsed.scheme == "https"
-            and bool(parsed.hostname)
-            and not parsed.username
-            and not parsed.password
-        )
-    except Exception:
-        return False
+    return any(
+        host == domain or host.endswith("." + domain)
+        for domain in OFFICIAL_DOMAINS
+    )
+
+
+def resolve_official_url(url):
+    """
+    Follow redirects and reject links that do not end on
+    an approved platform domain. Fail closed on errors.
+    """
+    try:
+        if not url.startswith("https://"):
+            return None
+
+        with fetch_response(url, timeout=20) as response:
+            final_url = response.geturl()
+
+        parsed = urlparse(final_url)
+
+        if parsed.scheme != "https":
+            return None
+
+        if not domain_allowed(parsed.hostname):
+            return None
+
+        path_parts = {
+            part.lower()
+            for part in parsed.path.split("/")
+            if part
+        }
+
+        if path_parts.intersection(EDITORIAL_PATHS):
+            return None
+
+        return final_url
+
+    except Exception as error:
+        print("Source verification rejected:", error)
+        return None
 
 
 def classify(item):
@@ -244,18 +267,15 @@ def classify(item):
     description = item["description"].lower()
     combined = title + " " + description
 
-    # Reject editorial articles and generic news announcements.
     if any(phrase in title for phrase in EDITORIAL_PHRASES):
         return None, None
 
-    # Reject obvious scams and offers with explicit financial risks.
     if any(phrase in combined for phrase in BLOCKED_PHRASES):
         return None, None
 
     if any(phrase in combined for phrase in RISK_PHRASES):
         return None, None
 
-    # Require a specific campaign action in the headline.
     if not any(
         re.search(pattern, title, re.IGNORECASE)
         for pattern in CAMPAIGN_TITLE_PATTERNS
@@ -284,9 +304,7 @@ def load_state():
 
 
 def save_state(state):
-    state["reported"] = state.get(
-        "reported", []
-    )[-MAX_HISTORY:]
+    state["reported"] = state.get("reported", [])[-MAX_HISTORY:]
 
     with open(STATE_FILE, "w", encoding="utf-8") as file:
         json.dump(state, file, indent=2)
@@ -305,10 +323,7 @@ def send_telegram(message):
         "disable_web_page_preview": "true",
     }).encode()
 
-    request = urllib.request.Request(
-        url,
-        data=payload,
-    )
+    request = urllib.request.Request(url, data=payload)
 
     with urllib.request.urlopen(request, timeout=25) as response:
         result = json.loads(response.read())
@@ -318,7 +333,7 @@ def send_telegram(message):
 
 
 def main():
-    print("Starting Crypto Opportunity Hunter v2")
+    print("Starting Crypto Opportunity Hunter v3")
 
     state = load_state()
     reported = set(state.get("reported", []))
@@ -326,6 +341,7 @@ def main():
     discovered = []
     successful_feeds = 0
     failed_feeds = 0
+    rejected_sources = 0
 
     for feed_url in FEEDS:
         try:
@@ -333,35 +349,25 @@ def main():
             successful_feeds += 1
 
             for item in entries:
-                if not valid_link(item["link"]):
-                    continue
-
-                host = (
-                    urlparse(item["link"]).hostname or ""
-                ).lower()
-
-                # X/Twitter remains disabled until a dependable
-                # free discovery source is available.
-                if host in (
-                    "x.com",
-                    "www.x.com",
-                    "twitter.com",
-                    "www.twitter.com",
-                ):
-                    continue
-
                 category, status = classify(item)
 
                 if not category:
                     continue
 
+                final_url = resolve_official_url(item["link"])
+
+                if not final_url:
+                    rejected_sources += 1
+                    continue
+
                 fingerprint = hashlib.sha256(
-                    item["link"].encode("utf-8")
+                    final_url.encode("utf-8")
                 ).hexdigest()
 
                 if fingerprint in reported:
                     continue
 
+                item["link"] = final_url
                 item["category"] = category
                 item["status"] = status
                 item["fingerprint"] = fingerprint
@@ -372,11 +378,8 @@ def main():
             failed_feeds += 1
             print("Feed error:", error)
 
-    if successful_feeds == 0:
-        raise RuntimeError("All discovery feeds failed")
-
-    # Remove duplicate links before sending.
     unique = {}
+
     for item in discovered:
         unique[item["fingerprint"]] = item
 
@@ -386,14 +389,20 @@ def main():
         "%Y-%m-%d %H:%M UTC"
     )
 
+    for item in discovered:
+        reported.add(item["fingerprint"])
+
+    save_state({
+        "reported": list(reported)[-MAX_HISTORY:]
+    })
+
     if discovered:
         message = (
-            "🚀 CRYPTO OPPORTUNITY HUNTER v2\n"
-            "Possible campaign announcements\n\n"
+            "🚀 CRYPTO OPPORTUNITY HUNTER v3\n"
+            "Possible campaigns on approved platforms\n\n"
             "⚠️ NOT VERIFIED OR ENDORSED.\n"
-            "These are campaign-style search results, "
-            "not confirmed rewards.\n"
-            "Check the official website and full terms.\n\n"
+            "A source-domain match does not prove a campaign is genuine.\n"
+            "Read the complete official terms before participating.\n\n"
         )
 
         for number, item in enumerate(discovered, 1):
@@ -401,25 +410,19 @@ def main():
                 f"{number}. {item['category']}\n"
                 f"Status: {item['status']}\n"
                 f"Title: {item['title'][:180]}\n"
-                f"Source link: {item['link']}\n\n"
+                f"Platform link: {item['link']}\n\n"
             )
-
-            reported.add(item["fingerprint"])
-
-        save_state({
-            "reported": list(reported)
-        })
-
     else:
         message = (
-            "🟢 CRYPTO OPPORTUNITY HUNTER v2\n\n"
-            "Scanner ran successfully.\n"
-            "No campaign-style results passed the filters.\n\n"
+            "🟢 CRYPTO OPPORTUNITY HUNTER v3\n\n"
+            "No results passed the campaign and approved-source filters.\n"
+            "This is better than sending unverified news articles.\n\n"
         )
 
     message += (
         f"Feeds successful: {successful_feeds}\n"
         f"Feeds failed: {failed_feeds}\n"
+        f"Rejected source links: {rejected_sources}\n"
         f"New leads: {len(discovered)}\n"
         f"Time: {now}\n\n"
         "🔐 Never share seed phrases or private keys.\n"
