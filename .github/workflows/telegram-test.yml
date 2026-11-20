@@ -54,4 +54,3 @@ jobs:
 
           print("Telegram message delivered successfully.")
           PY
-concurrency: 
