@@ -1,12 +1,12 @@
-
 import os
-import json
 import re
+import json
 import html
 import hashlib
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
+
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -14,63 +14,78 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 
 STATE_FILE = ".scanner_state.json"
-MAX_ALERTS = 8
-MAX_HISTORY = 1000
+MAX_ALERTS = 5
+MAX_HISTORY = 1500
 MAX_ITEMS_PER_FEED = 40
 
+# Search for campaign-style announcements, not general crypto news.
 QUERIES = [
-    '"crypto airdrop" OR "token giveaway"',
-    '"crypto contest" OR "crypto prize giveaway"',
-    '"crypto learn and earn" rewards',
-    '"crypto testnet rewards" OR "web3 quests"',
-    '"web3 bug bounty" OR "crypto security bounty"',
-    '"web3 paid contributor" OR "crypto freelance"',
-    '"Stake" giveaway OR "Stake" social competition',
-    '"Solcasino" giveaway OR "Solcasino" competition',
-    '"casino crypto giveaway" OR "casino no deposit giveaway"',
+    '"airdrop is live" crypto',
+    '"claim your airdrop" crypto',
+    '"join our giveaway" crypto',
+    '"official crypto giveaway" enter',
+    '"win bitcoin" giveaway enter',
+    '"win ethereum" giveaway enter',
+    '"learn and earn" crypto campaign rewards',
+    '"testnet incentive program" crypto join',
+    '"web3 bug bounty program" reward submit',
+    '"Stake" official giveaway enter',
+    '"Solcasino" official giveaway enter',
+    '"casino social giveaway" crypto enter',
 ]
 
-NEWS_FEEDS = [
-    "https://cointelegraph.com/rss",
-    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+FEEDS = [
+    "https://news.google.com/rss/search?" + urllib.parse.urlencode({
+        "q": query,
+        "hl": "en-US",
+        "gl": "US",
+        "ceid": "US:en",
+    })
+    for query in QUERIES
 ]
 
-CATEGORIES = {
-    "Airdrops & token rewards": [
-        "airdrop", "token giveaway", "token distribution",
-        "claim rewards"
-    ],
-    "Giveaways & contests": [
-        "crypto giveaway", "crypto contest", "prize pool",
-        "win crypto", "giveaway"
-    ],
-    "Learn & Earn": [
-        "learn and earn", "learning rewards"
-    ],
-    "Testnets & quests": [
-        "testnet rewards", "testnet incentive",
-        "ecosystem quest", "web3 quest"
-    ],
-    "Bug bounties": [
-        "bug bounty", "security bounty",
-        "vulnerability reward"
-    ],
-    "Paid Web3 tasks": [
-        "web3 jobs", "paid contributor",
-        "developer bounty", "crypto freelance"
-    ],
-    "Casino social giveaways": [
-        "stake giveaway", "stake social competition",
-        "solcasino giveaway", "solcasino competition",
-        "casino crypto giveaway", "casino giveaway"
-    ],
-}
+# These phrases strongly suggest editorial/news content, not a live campaign.
+EDITORIAL_PHRASES = [
+    "best crypto",
+    "best learn",
+    "best platforms",
+    "top crypto",
+    "top 10",
+    "top 5",
+    "how to",
+    "what is",
+    "explained",
+    "beginner guide",
+    "ultimate guide",
+    "review",
+    "price prediction",
+    "market analysis",
+    "market update",
+    "price analysis",
+    "raises $",
+    "raised $",
+    "funding round",
+    "secures funding",
+    "investment round",
+    "company announces",
+    "launches feature",
+    "partnership announced",
+    "acquisition",
+    "interview",
+    "opinion",
+    "report",
+    "weekly roundup",
+    "monthly roundup",
+    "year in review",
+    "in 2024",
+    "in 2025",
+]
 
 BLOCKED_PHRASES = [
-    "send crypto to receive",
-    "send us your bitcoin",
     "seed phrase required",
     "share your private key",
+    "send crypto to receive",
+    "send us your bitcoin",
     "wallet verification fee",
     "claim fee",
     "activation fee",
@@ -81,54 +96,93 @@ BLOCKED_PHRASES = [
 ]
 
 RISK_PHRASES = [
-    "deposit required", "first deposit",
-    "wagering requirement", "wager requirement",
-    "playthrough requirement", "turnover requirement",
-    "bet to qualify", "purchase required",
+    "deposit required",
+    "first deposit",
+    "minimum deposit",
+    "wagering requirement",
+    "wager requirement",
+    "playthrough requirement",
+    "turnover requirement",
+    "bet to qualify",
+    "purchase required",
+    "buy tokens to qualify",
+    "stake tokens to qualify",
 ]
 
-ACTION_TERMS = [
-    "enter giveaway", "join giveaway", "giveaway ends",
-    "win crypto", "win bitcoin", "win ethereum",
-    "claim airdrop", "airdrop is live", "register to win",
-    "official giveaway", "prize draw", "contest entry",
-    "learn and earn", "testnet rewards",
-    "bug bounty program", "paid contributor",
-    "giveaway is live", "win a prize",
+# A result must have a concrete campaign action in its TITLE.
+CAMPAIGN_TITLE_PATTERNS = [
+    r"\bairdrop is live\b",
+    r"\bclaim your\b.*\bairdrop\b",
+    r"\bclaim .* tokens\b",
+    r"\bjoin our\b.*\bgiveaway\b",
+    r"\benter our\b.*\bgiveaway\b",
+    r"\bwin\b.*\b(giveaway|contest|prize|bitcoin|ethereum|crypto)\b",
+    r"\bgiveaway\b.*\b(enter|join|ends|win)\b",
+    r"\b(enter|join)\b.*\b(competition|contest|giveaway)\b",
+    r"\blearn and earn\b.*\b(rewards|campaign|complete|earn)\b",
+    r"\btestnet\b.*\b(rewards|incentives|points|campaign)\b",
+    r"\b(bug bounty|security bounty)\b.*\b(program|reward|submit)\b",
+    r"\bpaid contributor\b",
 ]
 
 CASINO_TERMS = [
-    "stake", "solcasino", "casino"
+    "stake",
+    "solcasino",
+    "casino",
 ]
 
-def google_news_feed(query):
-    params = urllib.parse.urlencode({
-        "q": query,
-        "hl": "en-US",
-        "gl": "US",
-        "ceid": "US:en",
-    })
-    return "https://news.google.com/rss/search?" + params
-
-FEEDS = NEWS_FEEDS + [
-    google_news_feed(query) for query in QUERIES
+CATEGORY_RULES = [
+    (
+        "Casino social giveaways",
+        ["stake", "solcasino", "casino"],
+    ),
+    (
+        "Airdrops & token rewards",
+        ["airdrop", "claim your", "claim tokens"],
+    ),
+    (
+        "Giveaways & contests",
+        ["giveaway", "contest", "competition", "prize"],
+    ),
+    (
+        "Learn & Earn",
+        ["learn and earn", "learning rewards"],
+    ),
+    (
+        "Testnets & quests",
+        ["testnet", "quest", "incentive program"],
+    ),
+    (
+        "Bug bounties",
+        ["bug bounty", "security bounty"],
+    ),
+    (
+        "Paid Web3 tasks",
+        ["paid contributor"],
+    ),
 ]
+
 
 def fetch(url):
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "CryptoOpportunityHunter/1.0"
-        }
+            "User-Agent": "Mozilla/5.0 CryptoOpportunityHunter/2.0"
+        },
     )
+
     with urllib.request.urlopen(request, timeout=25) as response:
         return response.read()
 
+
 def clean(value):
-    value = re.sub("<[^>]+>", " ", value or "")
+    value = re.sub(r"<[^>]+>", " ", value or "")
     return re.sub(
-        r"\s+", " ", html.unescape(value)
+        r"\s+",
+        " ",
+        html.unescape(value),
     ).strip()
+
 
 def read_feed(url):
     root = ET.fromstring(fetch(url))
@@ -144,14 +198,15 @@ def read_feed(url):
 
     for entry in entries[:MAX_ITEMS_PER_FEED]:
         title = clean(entry.findtext("title"))
+
         link = entry.findtext("link") or ""
 
         if not link:
-            element = entry.find(
+            atom_link = entry.find(
                 "{http://www.w3.org/2005/Atom}link"
             )
-            if element is not None:
-                link = element.get("href", "")
+            if atom_link is not None:
+                link = atom_link.get("href", "")
 
         description = clean(
             entry.findtext("description")
@@ -169,6 +224,7 @@ def read_feed(url):
 
     return results
 
+
 def valid_link(url):
     try:
         parsed = urlparse(url)
@@ -182,31 +238,36 @@ def valid_link(url):
     except Exception:
         return False
 
+
 def classify(item):
-    text = (
-        item["title"] + " " + item["description"]
-    ).lower()
+    title = item["title"].lower()
+    description = item["description"].lower()
+    combined = title + " " + description
 
-    if any(term in text for term in BLOCKED_PHRASES):
-        return None, "REJECTED"
-
-    if any(term in text for term in RISK_PHRASES):
-        return None, "REJECTED - DEPOSIT OR WAGERING CONDITIONS"
-
-    if not any(term in text for term in ACTION_TERMS):
+    # Reject editorial articles and generic news announcements.
+    if any(phrase in title for phrase in EDITORIAL_PHRASES):
         return None, None
 
-    if any(term in text for term in CASINO_TERMS):
-        return (
-            "Casino social giveaways",
-            "NEEDS MANUAL REVIEW"
-        )
+    # Reject obvious scams and offers with explicit financial risks.
+    if any(phrase in combined for phrase in BLOCKED_PHRASES):
+        return None, None
 
-    for category, keywords in CATEGORIES.items():
-        if any(keyword in text for keyword in keywords):
+    if any(phrase in combined for phrase in RISK_PHRASES):
+        return None, None
+
+    # Require a specific campaign action in the headline.
+    if not any(
+        re.search(pattern, title, re.IGNORECASE)
+        for pattern in CAMPAIGN_TITLE_PATTERNS
+    ):
+        return None, None
+
+    for category, keywords in CATEGORY_RULES:
+        if any(keyword in combined for keyword in keywords):
             return category, "NEEDS MANUAL REVIEW"
 
     return None, None
+
 
 def load_state():
     try:
@@ -221,6 +282,7 @@ def load_state():
     except (FileNotFoundError, json.JSONDecodeError):
         return {"reported": []}
 
+
 def save_state(state):
     state["reported"] = state.get(
         "reported", []
@@ -229,10 +291,12 @@ def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as file:
         json.dump(state, file, indent=2)
 
+
 def send_telegram(message):
     url = (
-        f"https://api.telegram.org/bot"
-        f"{BOT_TOKEN}/sendMessage"
+        "https://api.telegram.org/bot"
+        + BOT_TOKEN
+        + "/sendMessage"
     )
 
     payload = urllib.parse.urlencode({
@@ -243,7 +307,7 @@ def send_telegram(message):
 
     request = urllib.request.Request(
         url,
-        data=payload
+        data=payload,
     )
 
     with urllib.request.urlopen(request, timeout=25) as response:
@@ -252,8 +316,9 @@ def send_telegram(message):
     if not result.get("ok"):
         raise RuntimeError("Telegram delivery failed")
 
+
 def main():
-    print("Starting Crypto Opportunity Hunter")
+    print("Starting Crypto Opportunity Hunter v2")
 
     state = load_state()
     reported = set(state.get("reported", []))
@@ -275,11 +340,13 @@ def main():
                     urlparse(item["link"]).hostname or ""
                 ).lower()
 
-                # X discovery remains disabled until a dependable
-                # free source is available.
+                # X/Twitter remains disabled until a dependable
+                # free discovery source is available.
                 if host in (
-                    "x.com", "www.x.com",
-                    "twitter.com", "www.twitter.com"
+                    "x.com",
+                    "www.x.com",
+                    "twitter.com",
+                    "www.twitter.com",
                 ):
                     continue
 
@@ -289,7 +356,7 @@ def main():
                     continue
 
                 fingerprint = hashlib.sha256(
-                    item["link"].encode()
+                    item["link"].encode("utf-8")
                 ).hexdigest()
 
                 if fingerprint in reported:
@@ -303,14 +370,17 @@ def main():
 
         except Exception as error:
             failed_feeds += 1
-            print(f"Feed error: {error}")
+            print("Feed error:", error)
 
     if successful_feeds == 0:
-        raise RuntimeError(
-            "All discovery feeds failed"
-        )
+        raise RuntimeError("All discovery feeds failed")
 
-    discovered = discovered[:MAX_ALERTS]
+    # Remove duplicate links before sending.
+    unique = {}
+    for item in discovered:
+        unique[item["fingerprint"]] = item
+
+    discovered = list(unique.values())[:MAX_ALERTS]
 
     now = datetime.now(timezone.utc).strftime(
         "%Y-%m-%d %H:%M UTC"
@@ -318,11 +388,12 @@ def main():
 
     if discovered:
         message = (
-            "🚀 CRYPTO OPPORTUNITY HUNTER\n"
-            "New discovery leads\n\n"
-            "⚠️ NOT AUTOMATICALLY VERIFIED.\n"
-            "Check the official account, website and "
-            "full campaign conditions before participating.\n\n"
+            "🚀 CRYPTO OPPORTUNITY HUNTER v2\n"
+            "Possible campaign announcements\n\n"
+            "⚠️ NOT VERIFIED OR ENDORSED.\n"
+            "These are campaign-style search results, "
+            "not confirmed rewards.\n"
+            "Check the official website and full terms.\n\n"
         )
 
         for number, item in enumerate(discovered, 1):
@@ -341,9 +412,9 @@ def main():
 
     else:
         message = (
-            "🟢 CRYPTO OPPORTUNITY HUNTER HEARTBEAT\n\n"
+            "🟢 CRYPTO OPPORTUNITY HUNTER v2\n\n"
             "Scanner ran successfully.\n"
-            "No new matching leads found.\n\n"
+            "No campaign-style results passed the filters.\n\n"
         )
 
     message += (
@@ -353,11 +424,13 @@ def main():
         f"Time: {now}\n\n"
         "🔐 Never share seed phrases or private keys.\n"
         "Never pay to unlock a free reward.\n"
+        "No deposits, purchases or wagering.\n"
         "Manual approval only."
     )
 
     send_telegram(message)
     print("Telegram message delivered successfully.")
+
 
 if __name__ == "__main__":
     main()
