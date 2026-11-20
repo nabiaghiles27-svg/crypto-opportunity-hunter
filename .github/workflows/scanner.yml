@@ -3,28 +3,41 @@ name: Crypto Opportunity Hunter
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: crypto-opportunity-hunter
+  cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Get repository files
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Restore and save scanner history
-        uses: actions/cache@v4
+      - name: Restore scanner history
+        uses: actions/cache/restore@v4
         with:
           path: .scanner_state.json
-          key: crypto-scanner-state-${{ github.run_id }}-${{ github.run_attempt }}
+          key: crypto-scanner-state-${{ github.run_id }}
           restore-keys: |
             crypto-scanner-state-
 
-      - name: Run opportunity scanner
+      - name: Run scanner
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scanner.py
+
+      - name: Save scanner history
+        if: always() && hashFiles('.scanner_state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .scanner_state.json
+          key: crypto-scanner-state-${{ github.run_id }}
